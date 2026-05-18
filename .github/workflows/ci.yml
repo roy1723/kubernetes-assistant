@@ -41,8 +41,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Stage 2: evaluation (self-hosted Windows runner)
-  # Adds Python and Docker to PATH explicitly via GITHUB_PATH so it doesn't
-  # depend on the runner's inherited environment.
+  # FastAPI and eval merged into one step so the background process survives.
   # ---------------------------------------------------------------------------
   evaluate:
     name: Model Evaluation
@@ -58,14 +57,10 @@ jobs:
 
       - name: Add known tool paths to PATH
         run: |
-          # These paths are known-good from `where.exe python` and `where.exe docker`
-          # on the SAHIL runner machine. Adding to GITHUB_PATH makes them available
-          # in all subsequent steps of this job.
           $pythonDir = "C:\Users\ASUS\AppData\Local\Programs\Python\Python311"
           $pythonScripts = "C:\Users\ASUS\AppData\Local\Programs\Python\Python311\Scripts"
           $dockerDir = "C:\Program Files\Docker\Docker\resources\bin"
 
-          # Verify the paths actually exist before adding them
           if (Test-Path "$pythonDir\python.exe") {
             $pythonDir | Out-File -FilePath $env:GITHUB_PATH -Append
             $pythonScripts | Out-File -FilePath $env:GITHUB_PATH -Append
@@ -79,7 +74,7 @@ jobs:
             $dockerDir | Out-File -FilePath $env:GITHUB_PATH -Append
             Write-Host "Added Docker to PATH: $dockerDir"
           } else {
-            Write-Host "WARN: Docker not found at $dockerDir\docker.exe (eval doesn't need it, deploy does)"
+            Write-Host "WARN: Docker not found at $dockerDir\docker.exe (eval doesn't need it)"
           }
 
       - name: Environment diagnostic
@@ -123,20 +118,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install httpx==0.27.2 rouge-score==0.1.2 fastapi==0.115.0 "uvicorn[standard]==0.32.0" pydantic==2.9.2
 
-      - name: Start FastAPI inference server (background)
+      - name: Start FastAPI and run evaluation
         run: |
           $logFile = Join-Path $env:RUNNER_TEMP "fastapi.log"
           $errFile = Join-Path $env:RUNNER_TEMP "fastapi.err"
-          $pidFile = Join-Path $env:RUNNER_TEMP "fastapi.pid"
           $pythonExe = (Get-Command python).Source
 
+          # Start FastAPI in background - this step's shell session keeps it alive
           $proc = Start-Process -FilePath $pythonExe `
             -ArgumentList "inference_server/main.py" `
             -RedirectStandardOutput $logFile -RedirectStandardError $errFile `
             -PassThru -NoNewWindow
-          $proc.Id | Out-File -FilePath $pidFile
           Write-Host "Started FastAPI with PID $($proc.Id)"
 
+          # Wait for /health to respond
           $ready = $false
           for ($i = 1; $i -le 30; $i++) {
             Start-Sleep -Seconds 2
@@ -149,30 +144,30 @@ jobs:
           }
           if (-not $ready) {
             Write-Host "FastAPI did not respond on /health within 60s."
-            Write-Host "----- stdout -----"; Get-Content $logFile -ErrorAction SilentlyContinue
-            Write-Host "----- stderr -----"; Get-Content $errFile -ErrorAction SilentlyContinue
+            Write-Host "----- stdout -----"
+            Get-Content $logFile -ErrorAction SilentlyContinue
+            Write-Host "----- stderr -----"
+            Get-Content $errFile -ErrorAction SilentlyContinue
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
             exit 1
           }
-          Write-Host "FastAPI ready."
+          Write-Host "FastAPI ready. Running evaluation..."
 
-      - name: Run evaluation with threshold
-        run: |
+          # Run evaluation in the SAME step so FastAPI stays alive
           python eval/evaluate.py --threshold 0.14
+          $evalExit = $LASTEXITCODE
+          Write-Host "Evaluation exit code: $evalExit"
 
-      - name: Stop FastAPI
-        if: always()
-        run: |
-          $pidFile = Join-Path $env:RUNNER_TEMP "fastapi.pid"
-          if (Test-Path $pidFile) {
-            $pidValue = Get-Content $pidFile
-            try {
-              Stop-Process -Id $pidValue -Force -ErrorAction SilentlyContinue
-              Write-Host "Stopped FastAPI (PID $pidValue)"
-            } catch {
-              Write-Host "FastAPI already stopped"
-            }
-            Remove-Item $pidFile -ErrorAction SilentlyContinue
+          # Stop FastAPI cleanly
+          try {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            Write-Host "Stopped FastAPI (PID $($proc.Id))"
+          } catch {
+            Write-Host "FastAPI already stopped"
           }
+
+          # Propagate eval exit code
+          if ($evalExit -ne 0) { exit $evalExit }
 
       - name: Upload eval results artifact
         if: always()
@@ -269,7 +264,7 @@ jobs:
             exit 1
           }
 
-      - name: Verify Docker on runner
+      - name: Verify Docker
         run: |
           docker --version
 
