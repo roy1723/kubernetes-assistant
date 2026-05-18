@@ -68,10 +68,15 @@ jobs:
 
       - name: Verify required models exist
         run: |
-          $list = ollama list | Out-String
-          if (-not ($list -match "phi3:mini")) { Write-Host "Missing model: phi3:mini"; exit 1 }
-          if (-not ($list -match "phi3-kubernetes")) { Write-Host "Missing model: phi3-kubernetes"; exit 1 }
-          Write-Host "Both models present."
+          $resp = Invoke-RestMethod -Uri http://localhost:11434/api/tags
+          $names = $resp.models | ForEach-Object { $_.name }
+          Write-Host "Available models on runner:"
+          $names | ForEach-Object { Write-Host "  - $_" }
+          $hasMini = $names | Where-Object { $_ -match "phi3:mini" }
+          $hasFt = $names | Where-Object { $_ -match "phi3-kubernetes" }
+          if (-not $hasMini) { Write-Host "Missing model: phi3:mini"; exit 1 }
+          if (-not $hasFt) { Write-Host "Missing model: phi3-kubernetes"; exit 1 }
+          Write-Host "Both required models present."
 
       - name: Install Python deps for eval
         run: |
@@ -197,7 +202,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=orchestration
 
   # ---------------------------------------------------------------------------
-  # Stage 4: deploy on self-hosted runner (Windows pwsh).
+  # Stage 4: deploy on self-hosted runner.
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy
