@@ -41,7 +41,6 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Stage 2: evaluation (self-hosted Windows runner)
-  # Only runs on direct push to main (NOT PRs - security).
   # ---------------------------------------------------------------------------
   evaluate:
     name: Model Evaluation
@@ -54,6 +53,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - name: Verify Ollama is running on runner
         run: |
@@ -87,7 +91,9 @@ jobs:
         run: |
           $logFile = Join-Path $env:RUNNER_TEMP "fastapi.log"
           $pidFile = Join-Path $env:RUNNER_TEMP "fastapi.pid"
-          $proc = Start-Process -FilePath "python" `
+          $pythonExe = (Get-Command python).Source
+          Write-Host "Using Python at: $pythonExe"
+          $proc = Start-Process -FilePath $pythonExe `
             -ArgumentList "inference_server/main.py" `
             -RedirectStandardOutput $logFile -RedirectStandardError "$logFile.err" `
             -PassThru -NoNewWindow
@@ -142,7 +148,6 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Stage 3: build Docker images, push to GHCR
-  # GitHub-hosted Linux runner.
   # ---------------------------------------------------------------------------
   docker-build:
     name: Build & Push Docker Images
@@ -202,7 +207,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=orchestration
 
   # ---------------------------------------------------------------------------
-  # Stage 4: deploy on self-hosted runner.
+  # Stage 4: deploy on self-hosted runner
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy
