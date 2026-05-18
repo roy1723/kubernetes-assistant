@@ -41,6 +41,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Stage 2: evaluation (self-hosted Windows runner)
+  # Runner inherits Python and Docker from the shell that launched ./run.cmd
   # ---------------------------------------------------------------------------
   evaluate:
     name: Model Evaluation
@@ -54,19 +55,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
       - name: Environment diagnostic
         run: |
           Write-Host "=== Environment diagnostic ==="
-          Write-Host "Python: $((Get-Command python -ErrorAction SilentlyContinue).Source)"
-          Write-Host "Pip:    $((Get-Command pip -ErrorAction SilentlyContinue).Source)"
+          $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+          if ($pythonCmd) {
+            Write-Host "Python: $($pythonCmd.Source)"
+            python --version
+          } else {
+            Write-Host "ERROR: python not found on PATH."
+            Write-Host "Restart the GitHub Actions runner from a shell where 'where.exe python' works."
+            exit 1
+          }
           Write-Host "Working dir: $(Get-Location)"
-          Write-Host "PATH (first 5 entries):"
-          ($env:PATH -split ';')[0..4] | ForEach-Object { Write-Host "  $_" }
 
       - name: Verify Ollama HTTP API
         run: |
@@ -76,7 +77,6 @@ jobs:
             Write-Host "Ollama API reachable."
           } catch {
             Write-Host "ERROR: Ollama not reachable at http://localhost:11434"
-            Write-Host "Please ensure Ollama is running on the runner machine."
             exit 1
           }
 
@@ -103,7 +103,6 @@ jobs:
           $errFile = Join-Path $env:RUNNER_TEMP "fastapi.err"
           $pidFile = Join-Path $env:RUNNER_TEMP "fastapi.pid"
           $pythonExe = (Get-Command python).Source
-          Write-Host "Using Python: $pythonExe"
 
           $proc = Start-Process -FilePath $pythonExe `
             -ArgumentList "inference_server/main.py" `
@@ -233,33 +232,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Locate Docker on runner
-        id: docker_path
+      - name: Verify Docker on runner
         run: |
-          # Try standard discovery
           $dockerCmd = Get-Command docker -ErrorAction SilentlyContinue
-          if ($dockerCmd) {
-            $dockerExe = $dockerCmd.Source
-          } else {
-            # Fall back to common Docker Desktop install paths
+          if (-not $dockerCmd) {
             $candidates = @(
               "C:\Program Files\Docker\Docker\resources\bin\docker.exe",
               "$env:ProgramFiles\Docker\Docker\resources\bin\docker.exe"
             )
             $dockerExe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
             if ($dockerExe) {
-              # Add Docker's bin folder to PATH for subsequent steps
               $dockerDir = Split-Path $dockerExe
               "PATH=$dockerDir;$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Append
-              Write-Host "Added Docker dir to PATH: $dockerDir"
+              Write-Host "Added Docker to PATH: $dockerDir"
+            } else {
+              Write-Host "ERROR: Docker not found. Install Docker Desktop or restart runner from a shell with docker on PATH."
+              exit 1
             }
+          } else {
+            Write-Host "Docker found: $($dockerCmd.Source)"
           }
-          if (-not $dockerExe) {
-            Write-Host "ERROR: Could not find docker.exe on the runner."
-            Write-Host "Ensure Docker Desktop is installed on the runner machine."
-            exit 1
-          }
-          Write-Host "Docker found at: $dockerExe"
 
       - name: Record current image SHA for rollback
         id: prev
