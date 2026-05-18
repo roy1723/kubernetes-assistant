@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1.4
+#
+# Multi-stage Dockerfile for the FastAPI inference server.
+# The server is a thin HTTP wrapper around Ollama; it does not load models
+# itself, so the runtime image is small (~150 MB).
+
+# ---------- Stage 1: builder ----------
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+# Build deps for any wheels that need compilation
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/requirements.inference.txt .
+RUN pip install --no-cache-dir --user -r requirements.inference.txt
+
+
+# ---------- Stage 2: runtime ----------
+FROM python:3.11-slim AS runtime
+
+# Run as non-root user
+RUN useradd -m -u 1000 appuser
+
+WORKDIR /app
+
+# Copy installed Python packages from builder stage
+COPY --from=builder /root/.local /home/appuser/.local
+RUN chown -R appuser:appuser /home/appuser/.local
+
+# Copy app source
+COPY --chown=appuser:appuser inference_server/main.py ./
+
+USER appuser
+ENV PATH=/home/appuser/.local/bin:$PATH
+ENV OLLAMA_URL=http://ollama:11434
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8000
+
+# Healthcheck calls /health; healthy when Ollama is reachable from this container
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
+    CMD python -c "import httpx; r=httpx.get('http://localhost:8000/health', timeout=3); r.raise_for_status()" \
+        || exit 1
+
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1.4
+#
+# Multi-stage Dockerfile for the orchestration container.
+# Contains: Gradio UI + ReAct agent + router + MCP server code.
+# The agent launches mcp_server/server.py as a subprocess via stdio,
+# so we bundle MCP code, ChromaDB, and the docs corpus here.
+
+# ---------- Stage 1: builder ----------
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/requirements.orchestration.txt .
+RUN pip install --no-cache-dir --user -r requirements.orchestration.txt
+
+
+# ---------- Stage 2: runtime ----------
+FROM python:3.11-slim AS runtime
+
+RUN useradd -m -u 1000 appuser
+
+WORKDIR /app
+
+COPY --from=builder /root/.local /home/appuser/.local
+RUN chown -R appuser:appuser /home/appuser/.local
+
+# Copy all components the orchestration needs
+COPY --chown=appuser:appuser orchestration/ ./orchestration/
+COPY --chown=appuser:appuser agent/         ./agent/
+COPY --chown=appuser:appuser mcp_server/    ./mcp_server/
+COPY --chown=appuser:appuser data/chroma/   ./data/chroma/
+COPY --chown=appuser:appuser data/k8s_docs.json ./data/
+
+# Logs directory for agent JSON output
+RUN mkdir -p logs && chown appuser:appuser logs
+
+USER appuser
+ENV PATH=/home/appuser/.local/bin:$PATH
+ENV PYTHONUNBUFFERED=1
+ENV INFERENCE_URL=http://inference_server:8000
+ENV HF_HOME=/home/appuser/.cache/huggingface
+# Tell Gradio not to attempt analytics calls in containerized prod
+ENV GRADIO_ANALYTICS_ENABLED=False
+
+EXPOSE 7860
+
+# Healthcheck: Gradio's root endpoint should return 200
+HEALTHCHECK --interval=20s --timeout=5s --start-period=60s --retries=5 \
+    CMD python -c "import httpx; httpx.get('http://localhost:7860/', timeout=3).raise_for_status()" \
+        || exit 1
+
+CMD ["python", "orchestration/app.py"]

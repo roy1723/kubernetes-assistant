@@ -1,0 +1,112 @@
+# docker-compose.yml
+#
+# Brings up the full Kubernetes Assistant stack with one command:
+#   docker compose up
+#
+# Services:
+#   ollama         - Ollama model server, holds GGUF models
+#   ollama_setup   - one-shot job: creates phi3-kubernetes from your GGUF
+#                    and pulls base phi3:mini
+#   inference_server - FastAPI wrapping Ollama (port 8000)
+#   orchestration  - Gradio UI + ReAct agent + MCP (port 7860)
+#
+# After `docker compose up`, open http://localhost:7860
+
+services:
+
+  # ----- Ollama model server -----
+  ollama:
+    image: ollama/ollama:latest
+    container_name: k8s_assistant_ollama
+    volumes:
+      - ollama_data:/root/.ollama
+      - ./inference_server/models:/models:ro
+      - ./docker/Modelfile.docker:/Modelfile:ro
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    # ---- GPU passthrough (uncomment if you have nvidia-container-toolkit) ----
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # ----- One-shot: create models in Ollama -----
+  ollama_setup:
+    image: ollama/ollama:latest
+    container_name: k8s_assistant_setup
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ./inference_server/models:/models:ro
+      - ./docker/Modelfile.docker:/Modelfile:ro
+    environment:
+      - OLLAMA_HOST=ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        echo "==> Checking if phi3-kubernetes model exists..."
+        if ollama list | grep -q phi3-kubernetes; then
+          echo "    phi3-kubernetes already registered, skipping."
+        else
+          echo "    Creating phi3-kubernetes from /Modelfile..."
+          ollama create phi3-kubernetes -f /Modelfile
+        fi
+        echo "==> Checking if phi3:mini base model exists..."
+        if ollama list | grep -q "^phi3:mini"; then
+          echo "    phi3:mini already pulled, skipping."
+        else
+          echo "    Pulling phi3:mini..."
+          ollama pull phi3:mini
+        fi
+        echo "==> Setup complete. Available models:"
+        ollama list
+    restart: "no"
+
+  # ----- FastAPI inference wrapper -----
+  inference_server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.inference
+    image: k8s-assistant/inference_server:latest
+    container_name: k8s_assistant_inference
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+    ports:
+      - "8000:8000"
+    depends_on:
+      ollama:
+        condition: service_healthy
+      ollama_setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ----- Gradio UI + ReAct agent + MCP code -----
+  orchestration:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.orchestration
+    image: k8s-assistant/orchestration:latest
+    container_name: k8s_assistant_ui
+    environment:
+      - INFERENCE_URL=http://inference_server:8000
+    ports:
+      - "7860:7860"
+    depends_on:
+      - inference_server
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+    name: k8s_assistant_ollama_data

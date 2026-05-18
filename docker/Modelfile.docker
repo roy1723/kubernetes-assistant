@@ -1,0 +1,19 @@
+FROM /models/phi3-kubernetes-q4_k_m.gguf
+
+TEMPLATE """{{ if .System }}<|system|>
+{{ .System }}<|end|>
+{{ end }}{{ if .Prompt }}<|user|>
+{{ .Prompt }}<|end|>
+{{ end }}<|assistant|>
+{{ .Response }}<|end|>
+"""
+
+SYSTEM """You are a Kubernetes expert assistant. You answer questions about Kubernetes concisely and accurately, with concrete kubectl commands and YAML examples where appropriate. When you don't know something, say so."""
+
+PARAMETER temperature 0.4
+PARAMETER top_p 0.9
+PARAMETER num_predict 512
+PARAMETER num_ctx 2048
+PARAMETER stop "<|end|>"
+PARAMETER stop "<|endoftext|>"
+PARAMETER stop "<|user|>"

@@ -1,0 +1,25 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Project artifacts
+logs/
+data/chroma/
+inference_server/models/*.gguf
+outputs/lora_adapters/*.zip
+eval/results.json
+benchmark_results.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/

@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1.4
+#
+# Multi-stage Dockerfile for the MCP server (standalone build).
+#
+# The MCP server uses stdio transport - in the live compose stack, the
+# orchestration container spawns this code as a subprocess. This standalone
+# image is built for CI/CD's "build image for MCP server" requirement and
+# can be run independently for testing.
+
+# ---------- Stage 1: builder ----------
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/requirements.mcp.txt .
+RUN pip install --no-cache-dir --user -r requirements.mcp.txt
+
+
+# ---------- Stage 2: runtime ----------
+FROM python:3.11-slim AS runtime
+
+RUN useradd -m -u 1000 appuser
+
+WORKDIR /app
+
+COPY --from=builder /root/.local /home/appuser/.local
+RUN chown -R appuser:appuser /home/appuser/.local
+
+# Copy MCP server code and the persistent vector store
+COPY --chown=appuser:appuser mcp_server/ ./mcp_server/
+COPY --chown=appuser:appuser data/chroma/ ./data/chroma/
+COPY --chown=appuser:appuser data/k8s_docs.json ./data/
+
+USER appuser
+ENV PATH=/home/appuser/.local/bin:$PATH
+ENV PYTHONUNBUFFERED=1
+# Hugging Face cache dir (sentence-transformers model)
+ENV HF_HOME=/home/appuser/.cache/huggingface
+
+# Trigger model download at build time would slow CI; defer to first run.
+# A real production setup would pre-download in the builder stage.
+
+CMD ["python", "mcp_server/server.py"]

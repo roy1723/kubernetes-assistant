@@ -1,0 +1,251 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Reusable environment block: image name parts
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: roy1723
+  REPO_NAME: kubernetes-assistant
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Stage 1: code quality (runs on GitHub-hosted runners, free + fast)
+  # ---------------------------------------------------------------------------
+  lint-and-type:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install lint tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.7.4 mypy==1.13.0
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Mypy type check
+        # Lenient config — fail only on errors, not warnings.
+        # Some 3rd-party libs lack stubs; ignore those imports.
+        run: mypy --config-file mypy.ini agent orchestration inference_server mcp_server eval scripts
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: evaluation against held-out test set
+  # Self-hosted: requires Ollama + models + GPU (or CPU) available locally.
+  # ---------------------------------------------------------------------------
+  evaluate:
+    name: Model Evaluation
+    needs: lint-and-type
+    runs-on: [self-hosted, kubernetes-assistant]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify Ollama is running on runner
+        shell: bash
+        run: |
+          curl -sf http://localhost:11434/api/tags > /dev/null || \
+            (echo "Ollama not reachable at localhost:11434. Start Ollama on the runner."; exit 1)
+
+      - name: Verify required models exist
+        shell: bash
+        run: |
+          set -e
+          ollama list | grep -q "phi3:mini" || (echo "Missing model: phi3:mini"; exit 1)
+          ollama list | grep -q "phi3-kubernetes" || (echo "Missing model: phi3-kubernetes"; exit 1)
+          echo "Both models present."
+
+      - name: Install Python deps for eval
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install httpx==0.27.2 rouge-score==0.1.2
+
+      - name: Start FastAPI inference server (background)
+        shell: bash
+        run: |
+          pip install fastapi==0.115.0 uvicorn==0.32.0 pydantic==2.9.2
+          nohup python inference_server/main.py > /tmp/fastapi.log 2>&1 &
+          echo $! > /tmp/fastapi.pid
+          # Wait for /health to respond
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/health > /dev/null; then
+              echo "FastAPI ready after ${i}s"; break
+            fi
+            sleep 1
+          done
+          curl -sf http://localhost:8000/health || (echo "FastAPI did not come up"; cat /tmp/fastapi.log; exit 1)
+
+      - name: Run evaluation with threshold
+        shell: bash
+        run: |
+          python eval/evaluate.py --threshold 0.14
+        # ^ exits non-zero if fine-tuned ROUGE-L < 0.14, failing the workflow.
+
+      - name: Stop FastAPI
+        if: always()
+        shell: bash
+        run: |
+          if [ -f /tmp/fastapi.pid ]; then
+            kill $(cat /tmp/fastapi.pid) || true
+            rm /tmp/fastapi.pid
+          fi
+
+      - name: Upload eval results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results-${{ github.sha }}
+          path: eval/results.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Stage 3: build the three Docker images, push to GHCR tagged with SHA
+  # GitHub-hosted runner; uses buildx for multi-stage caching.
+  # ---------------------------------------------------------------------------
+  docker-build:
+    name: Build & Push Docker Images
+    needs: evaluate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Build & push inference image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.inference
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:latest
+          cache-from: type=gha,scope=inference
+          cache-to: type=gha,mode=max,scope=inference
+
+      - name: Build & push MCP image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.mcp
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-mcp:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-mcp:latest
+          cache-from: type=gha,scope=mcp
+          cache-to: type=gha,mode=max,scope=mcp
+
+      - name: Build & push orchestration image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.orchestration
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:latest
+          cache-from: type=gha,scope=orchestration
+          cache-to: type=gha,mode=max,scope=orchestration
+
+  # ---------------------------------------------------------------------------
+  # Stage 4: deploy to the self-hosted environment
+  # Only runs on push to main (NOT pull requests).
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy
+    needs: docker-build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, kubernetes-assistant]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Record current image SHA (for rollback)
+        id: prev
+        shell: bash
+        run: |
+          PREV=$(docker images --filter "reference=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:latest" --format '{{.Tag}}' | head -n 1 || true)
+          echo "previous_tag=${PREV}" >> $GITHUB_OUTPUT
+          echo "Previous tag captured: ${PREV}"
+
+      - name: Log in to GHCR on runner
+        shell: bash
+        run: |
+          echo "${{ secrets.GHCR_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+      - name: Pull new images
+        shell: bash
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:${{ github.sha }}
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:${{ github.sha }}
+
+      - name: Re-tag pulled images as :latest
+        shell: bash
+        run: |
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:${{ github.sha }} \
+                     ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:latest
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:${{ github.sha }} \
+                     ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:latest
+
+      - name: Restart stack
+        shell: bash
+        run: |
+          docker compose -f docker-compose.deploy.yml down || true
+          docker compose -f docker-compose.deploy.yml up -d
+
+      - name: Wait & health-check
+        id: health
+        shell: bash
+        run: |
+          set -e
+          # Allow up to 90s for stack to become healthy
+          for i in $(seq 1 30); do
+            INF_OK=$(curl -sf http://localhost:8000/health > /dev/null && echo yes || echo no)
+            UI_OK=$(curl -sf http://localhost:7860/ > /dev/null && echo yes || echo no)
+            if [ "$INF_OK" = "yes" ] && [ "$UI_OK" = "yes" ]; then
+              echo "Stack healthy after ${i}*3s"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "Health check FAILED (inference=$INF_OK, ui=$UI_OK)"
+          exit 1
+
+      - name: Rollback on health failure
+        if: failure() && steps.prev.outputs.previous_tag != ''
+        shell: bash
+        run: |
+          echo "Rolling back to previous tag: ${{ steps.prev.outputs.previous_tag }}"
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:${{ steps.prev.outputs.previous_tag }} \
+                     ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:latest
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:${{ steps.prev.outputs.previous_tag }} \
+                     ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:latest
+          docker compose -f docker-compose.deploy.yml up -d
+          echo "Rollback complete to ${{ steps.prev.outputs.previous_tag }}"

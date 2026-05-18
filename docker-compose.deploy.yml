@@ -1,0 +1,77 @@
+# docker-compose.deploy.yml
+#
+# Used by the CI/CD deploy step on the self-hosted runner.
+# Pulls published images from GHCR instead of building locally.
+# Identical service topology to docker-compose.yml.
+
+services:
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: k8s_assistant_ollama
+    volumes:
+      - ollama_data:/root/.ollama
+      - ./inference_server/models:/models:ro
+      - ./docker/Modelfile.docker:/Modelfile:ro
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  ollama_setup:
+    image: ollama/ollama:latest
+    container_name: k8s_assistant_setup
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ./inference_server/models:/models:ro
+      - ./docker/Modelfile.docker:/Modelfile:ro
+    environment:
+      - OLLAMA_HOST=ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if ! ollama list | grep -q phi3-kubernetes; then
+          ollama create phi3-kubernetes -f /Modelfile
+        fi
+        if ! ollama list | grep -q "^phi3:mini"; then
+          ollama pull phi3:mini
+        fi
+        ollama list
+    restart: "no"
+
+  inference_server:
+    image: ghcr.io/roy1723/kubernetes-assistant-inference:latest
+    container_name: k8s_assistant_inference
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+    ports:
+      - "8000:8000"
+    depends_on:
+      ollama:
+        condition: service_healthy
+      ollama_setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  orchestration:
+    image: ghcr.io/roy1723/kubernetes-assistant-orchestration:latest
+    container_name: k8s_assistant_ui
+    environment:
+      - INFERENCE_URL=http://inference_server:8000
+    ports:
+      - "7860:7860"
+    depends_on:
+      - inference_server
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+    name: k8s_assistant_ollama_data

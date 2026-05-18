@@ -1,0 +1,27 @@
+target-version = "py311"
+line-length = 100
+
+[lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes (real bugs)
+    "W",   # warnings
+    "I",   # import sorting
+    "UP",  # pyupgrade
+    "B",   # bug-prone patterns
+]
+ignore = [
+    "E501",   # line-too-long (handled by formatter)
+    "E402",   # module-level import not at top (we use sys.path tweaks)
+    "B008",   # function call in default arg (FastAPI/typer pattern)
+    "B904",   # raise from -- noisy and not always wanted
+    "UP007",  # X | Y syntax -- mypy is fine with it but we use both styles
+]
+
+[lint.per-file-ignores]
+"agent/test_agent.py" = ["F401", "F811"]
+"mcp_server/test_tools.py" = ["F401"]
+"scripts/*" = ["E402"]
+
+[lint.isort]
+known-first-party = ["agent", "orchestration", "mcp_server", "inference_server", "eval", "scripts"]
