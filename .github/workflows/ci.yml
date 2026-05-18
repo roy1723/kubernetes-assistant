@@ -59,27 +59,37 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Verify Ollama is running on runner
+      - name: Environment diagnostic
+        run: |
+          Write-Host "=== Environment diagnostic ==="
+          Write-Host "Python: $((Get-Command python -ErrorAction SilentlyContinue).Source)"
+          Write-Host "Pip:    $((Get-Command pip -ErrorAction SilentlyContinue).Source)"
+          Write-Host "Working dir: $(Get-Location)"
+          Write-Host "PATH (first 5 entries):"
+          ($env:PATH -split ';')[0..4] | ForEach-Object { Write-Host "  $_" }
+
+      - name: Verify Ollama HTTP API
         run: |
           try {
             $r = Invoke-WebRequest -UseBasicParsing -Uri http://localhost:11434/api/tags -TimeoutSec 5
             if ($r.StatusCode -ne 200) { throw "Bad status: $($r.StatusCode)" }
-            Write-Host "Ollama reachable."
+            Write-Host "Ollama API reachable."
           } catch {
-            Write-Host "Ollama not reachable at localhost:11434. Start Ollama on the runner."
+            Write-Host "ERROR: Ollama not reachable at http://localhost:11434"
+            Write-Host "Please ensure Ollama is running on the runner machine."
             exit 1
           }
 
-      - name: Verify required models exist
+      - name: Verify required models registered
         run: |
           $resp = Invoke-RestMethod -Uri http://localhost:11434/api/tags
           $names = $resp.models | ForEach-Object { $_.name }
-          Write-Host "Available models on runner:"
+          Write-Host "Available models:"
           $names | ForEach-Object { Write-Host "  - $_" }
           $hasMini = $names | Where-Object { $_ -match "phi3:mini" }
           $hasFt = $names | Where-Object { $_ -match "phi3-kubernetes" }
-          if (-not $hasMini) { Write-Host "Missing model: phi3:mini"; exit 1 }
-          if (-not $hasFt) { Write-Host "Missing model: phi3-kubernetes"; exit 1 }
+          if (-not $hasMini) { Write-Host "ERROR: Missing model phi3:mini"; exit 1 }
+          if (-not $hasFt)   { Write-Host "ERROR: Missing model phi3-kubernetes"; exit 1 }
           Write-Host "Both required models present."
 
       - name: Install Python deps for eval
@@ -90,17 +100,18 @@ jobs:
       - name: Start FastAPI inference server (background)
         run: |
           $logFile = Join-Path $env:RUNNER_TEMP "fastapi.log"
+          $errFile = Join-Path $env:RUNNER_TEMP "fastapi.err"
           $pidFile = Join-Path $env:RUNNER_TEMP "fastapi.pid"
           $pythonExe = (Get-Command python).Source
-          Write-Host "Using Python at: $pythonExe"
+          Write-Host "Using Python: $pythonExe"
+
           $proc = Start-Process -FilePath $pythonExe `
             -ArgumentList "inference_server/main.py" `
-            -RedirectStandardOutput $logFile -RedirectStandardError "$logFile.err" `
+            -RedirectStandardOutput $logFile -RedirectStandardError $errFile `
             -PassThru -NoNewWindow
           $proc.Id | Out-File -FilePath $pidFile
           Write-Host "Started FastAPI with PID $($proc.Id)"
 
-          # Wait for /health to respond
           $ready = $false
           for ($i = 1; $i -le 30; $i++) {
             Start-Sleep -Seconds 2
@@ -108,13 +119,13 @@ jobs:
               $r = Invoke-WebRequest -UseBasicParsing -Uri http://localhost:8000/health -TimeoutSec 3
               if ($r.StatusCode -eq 200) { $ready = $true; break }
             } catch {
-              # not ready yet, keep waiting
+              # not ready yet
             }
           }
           if (-not $ready) {
-            Write-Host "FastAPI did not come up. Log:"
-            Get-Content $logFile -ErrorAction SilentlyContinue
-            Get-Content "$logFile.err" -ErrorAction SilentlyContinue
+            Write-Host "FastAPI did not respond on /health within 60s."
+            Write-Host "----- stdout -----"; Get-Content $logFile -ErrorAction SilentlyContinue
+            Write-Host "----- stderr -----"; Get-Content $errFile -ErrorAction SilentlyContinue
             exit 1
           }
           Write-Host "FastAPI ready."
@@ -145,6 +156,7 @@ jobs:
           name: eval-results-${{ github.sha }}
           path: eval/results.json
           retention-days: 30
+          if-no-files-found: warn
 
   # ---------------------------------------------------------------------------
   # Stage 3: build Docker images, push to GHCR
@@ -220,6 +232,34 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Locate Docker on runner
+        id: docker_path
+        run: |
+          # Try standard discovery
+          $dockerCmd = Get-Command docker -ErrorAction SilentlyContinue
+          if ($dockerCmd) {
+            $dockerExe = $dockerCmd.Source
+          } else {
+            # Fall back to common Docker Desktop install paths
+            $candidates = @(
+              "C:\Program Files\Docker\Docker\resources\bin\docker.exe",
+              "$env:ProgramFiles\Docker\Docker\resources\bin\docker.exe"
+            )
+            $dockerExe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if ($dockerExe) {
+              # Add Docker's bin folder to PATH for subsequent steps
+              $dockerDir = Split-Path $dockerExe
+              "PATH=$dockerDir;$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Append
+              Write-Host "Added Docker dir to PATH: $dockerDir"
+            }
+          }
+          if (-not $dockerExe) {
+            Write-Host "ERROR: Could not find docker.exe on the runner."
+            Write-Host "Ensure Docker Desktop is installed on the runner machine."
+            exit 1
+          }
+          Write-Host "Docker found at: $dockerExe"
 
       - name: Record current image SHA for rollback
         id: prev
