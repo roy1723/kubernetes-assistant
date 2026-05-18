@@ -50,6 +50,7 @@ jobs:
   evaluate:
     name: Model Evaluation
     needs: lint-and-type
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, kubernetes-assistant]
     steps:
       - name: Checkout
