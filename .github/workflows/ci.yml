@@ -6,7 +6,6 @@ on:
   pull_request:
     branches: [main]
 
-# Reusable environment block: image name parts
 env:
   REGISTRY: ghcr.io
   IMAGE_OWNER: roy1723
@@ -15,7 +14,7 @@ env:
 jobs:
 
   # ---------------------------------------------------------------------------
-  # Stage 1: code quality (runs on GitHub-hosted runners, free + fast)
+  # Stage 1: code quality (GitHub-hosted Linux runner)
   # ---------------------------------------------------------------------------
   lint-and-type:
     name: Lint & Type Check
@@ -28,7 +27,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          
 
       - name: Install lint tooling
         run: |
@@ -39,72 +37,95 @@ jobs:
         run: ruff check .
 
       - name: Mypy type check
-        # Lenient config — fail only on errors, not warnings.
-        # Some 3rd-party libs lack stubs; ignore those imports.
         run: mypy --config-file mypy.ini agent orchestration inference_server mcp_server eval scripts
 
   # ---------------------------------------------------------------------------
-  # Stage 2: evaluation against held-out test set
-  # Self-hosted: requires Ollama + models + GPU (or CPU) available locally.
+  # Stage 2: evaluation (self-hosted Windows runner)
+  # Only runs on direct push to main (NOT PRs - security).
   # ---------------------------------------------------------------------------
   evaluate:
     name: Model Evaluation
     needs: lint-and-type
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, kubernetes-assistant]
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Verify Ollama is running on runner
-        shell: bash
         run: |
-          curl -sf http://localhost:11434/api/tags > /dev/null || \
-            (echo "Ollama not reachable at localhost:11434. Start Ollama on the runner."; exit 1)
+          try {
+            $r = Invoke-WebRequest -UseBasicParsing -Uri http://localhost:11434/api/tags -TimeoutSec 5
+            if ($r.StatusCode -ne 200) { throw "Bad status: $($r.StatusCode)" }
+            Write-Host "Ollama reachable."
+          } catch {
+            Write-Host "Ollama not reachable at localhost:11434. Start Ollama on the runner."
+            exit 1
+          }
 
       - name: Verify required models exist
-        shell: bash
         run: |
-          set -e
-          ollama list | grep -q "phi3:mini" || (echo "Missing model: phi3:mini"; exit 1)
-          ollama list | grep -q "phi3-kubernetes" || (echo "Missing model: phi3-kubernetes"; exit 1)
-          echo "Both models present."
+          $list = ollama list | Out-String
+          if (-not ($list -match "phi3:mini")) { Write-Host "Missing model: phi3:mini"; exit 1 }
+          if (-not ($list -match "phi3-kubernetes")) { Write-Host "Missing model: phi3-kubernetes"; exit 1 }
+          Write-Host "Both models present."
 
       - name: Install Python deps for eval
-        shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install httpx==0.27.2 rouge-score==0.1.2
+          pip install httpx==0.27.2 rouge-score==0.1.2 fastapi==0.115.0 "uvicorn[standard]==0.32.0" pydantic==2.9.2
 
       - name: Start FastAPI inference server (background)
-        shell: bash
         run: |
-          pip install fastapi==0.115.0 uvicorn==0.32.0 pydantic==2.9.2
-          nohup python inference_server/main.py > /tmp/fastapi.log 2>&1 &
-          echo $! > /tmp/fastapi.pid
+          $logFile = Join-Path $env:RUNNER_TEMP "fastapi.log"
+          $pidFile = Join-Path $env:RUNNER_TEMP "fastapi.pid"
+          $proc = Start-Process -FilePath "python" `
+            -ArgumentList "inference_server/main.py" `
+            -RedirectStandardOutput $logFile -RedirectStandardError "$logFile.err" `
+            -PassThru -NoNewWindow
+          $proc.Id | Out-File -FilePath $pidFile
+          Write-Host "Started FastAPI with PID $($proc.Id)"
+
           # Wait for /health to respond
-          for i in $(seq 1 30); do
-            if curl -sf http://localhost:8000/health > /dev/null; then
-              echo "FastAPI ready after ${i}s"; break
-            fi
-            sleep 1
-          done
-          curl -sf http://localhost:8000/health || (echo "FastAPI did not come up"; cat /tmp/fastapi.log; exit 1)
+          $ready = $false
+          for ($i = 1; $i -le 30; $i++) {
+            Start-Sleep -Seconds 2
+            try {
+              $r = Invoke-WebRequest -UseBasicParsing -Uri http://localhost:8000/health -TimeoutSec 3
+              if ($r.StatusCode -eq 200) { $ready = $true; break }
+            } catch {
+              # not ready yet, keep waiting
+            }
+          }
+          if (-not $ready) {
+            Write-Host "FastAPI did not come up. Log:"
+            Get-Content $logFile -ErrorAction SilentlyContinue
+            Get-Content "$logFile.err" -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Write-Host "FastAPI ready."
 
       - name: Run evaluation with threshold
-        shell: bash
         run: |
           python eval/evaluate.py --threshold 0.14
-        # ^ exits non-zero if fine-tuned ROUGE-L < 0.14, failing the workflow.
 
       - name: Stop FastAPI
         if: always()
-        shell: bash
         run: |
-          if [ -f /tmp/fastapi.pid ]; then
-            kill $(cat /tmp/fastapi.pid) || true
-            rm /tmp/fastapi.pid
-          fi
+          $pidFile = Join-Path $env:RUNNER_TEMP "fastapi.pid"
+          if (Test-Path $pidFile) {
+            $pidValue = Get-Content $pidFile
+            try {
+              Stop-Process -Id $pidValue -Force -ErrorAction SilentlyContinue
+              Write-Host "Stopped FastAPI (PID $pidValue)"
+            } catch {
+              Write-Host "FastAPI already stopped"
+            }
+            Remove-Item $pidFile -ErrorAction SilentlyContinue
+          }
 
       - name: Upload eval results artifact
         if: always()
@@ -115,8 +136,8 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # Stage 3: build the three Docker images, push to GHCR tagged with SHA
-  # GitHub-hosted runner; uses buildx for multi-stage caching.
+  # Stage 3: build Docker images, push to GHCR
+  # GitHub-hosted Linux runner.
   # ---------------------------------------------------------------------------
   docker-build:
     name: Build & Push Docker Images
@@ -176,77 +197,78 @@ jobs:
           cache-to: type=gha,mode=max,scope=orchestration
 
   # ---------------------------------------------------------------------------
-  # Stage 4: deploy to the self-hosted environment
-  # Only runs on push to main (NOT pull requests).
+  # Stage 4: deploy on self-hosted runner (Windows pwsh).
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy
     needs: docker-build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, kubernetes-assistant]
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Record current image SHA (for rollback)
+      - name: Record current image SHA for rollback
         id: prev
-        shell: bash
         run: |
-          PREV=$(docker images --filter "reference=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:latest" --format '{{.Tag}}' | head -n 1 || true)
-          echo "previous_tag=${PREV}" >> $GITHUB_OUTPUT
-          echo "Previous tag captured: ${PREV}"
+          $prev = docker images --filter "reference=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:latest" --format "{{.Tag}}" | Select-Object -First 1
+          if (-not $prev) { $prev = "" }
+          Write-Host "Previous tag captured: $prev"
+          "previous_tag=$prev" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Log in to GHCR on runner
-        shell: bash
         run: |
-          echo "${{ secrets.GHCR_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+          $token = "${{ secrets.GHCR_TOKEN }}"
+          $token | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
 
       - name: Pull new images
-        shell: bash
         run: |
           docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:${{ github.sha }}
           docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:${{ github.sha }}
 
       - name: Re-tag pulled images as :latest
-        shell: bash
         run: |
-          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:${{ github.sha }} \
-                     ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:latest
-          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:${{ github.sha }} \
-                     ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:latest
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:latest
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:latest
 
       - name: Restart stack
-        shell: bash
         run: |
-          docker compose -f docker-compose.deploy.yml down || true
+          docker compose -f docker-compose.deploy.yml down
+          if ($LASTEXITCODE -ne 0) { Write-Host "down returned non-zero (likely already stopped), continuing" }
           docker compose -f docker-compose.deploy.yml up -d
+          if ($LASTEXITCODE -ne 0) { Write-Host "compose up failed"; exit 1 }
 
-      - name: Wait & health-check
+      - name: Wait & health check
         id: health
-        shell: bash
         run: |
-          set -e
-          # Allow up to 90s for stack to become healthy
-          for i in $(seq 1 30); do
-            INF_OK=$(curl -sf http://localhost:8000/health > /dev/null && echo yes || echo no)
-            UI_OK=$(curl -sf http://localhost:7860/ > /dev/null && echo yes || echo no)
-            if [ "$INF_OK" = "yes" ] && [ "$UI_OK" = "yes" ]; then
-              echo "Stack healthy after ${i}*3s"
+          $infOk = "no"
+          $uiOk = "no"
+          for ($i = 1; $i -le 30; $i++) {
+            Start-Sleep -Seconds 3
+            try {
+              $r1 = Invoke-WebRequest -UseBasicParsing -Uri http://localhost:8000/health -TimeoutSec 3
+              if ($r1.StatusCode -eq 200) { $infOk = "yes" }
+            } catch { }
+            try {
+              $r2 = Invoke-WebRequest -UseBasicParsing -Uri http://localhost:7860/ -TimeoutSec 3
+              if ($r2.StatusCode -eq 200) { $uiOk = "yes" }
+            } catch { }
+            if ($infOk -eq "yes" -and $uiOk -eq "yes") {
+              Write-Host "Stack healthy after ${i}*3s"
               exit 0
-            fi
-            sleep 3
-          done
-          echo "Health check FAILED (inference=$INF_OK, ui=$UI_OK)"
+            }
+          }
+          Write-Host "Health check FAILED (inference=$infOk, ui=$uiOk)"
           exit 1
 
       - name: Rollback on health failure
         if: failure() && steps.prev.outputs.previous_tag != ''
-        shell: bash
         run: |
-          echo "Rolling back to previous tag: ${{ steps.prev.outputs.previous_tag }}"
-          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:${{ steps.prev.outputs.previous_tag }} \
-                     ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:latest
-          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:${{ steps.prev.outputs.previous_tag }} \
-                     ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:latest
+          Write-Host "Rolling back to previous tag: ${{ steps.prev.outputs.previous_tag }}"
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:${{ steps.prev.outputs.previous_tag }} ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:latest
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:${{ steps.prev.outputs.previous_tag }} ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:latest
           docker compose -f docker-compose.deploy.yml up -d
-          echo "Rollback complete to ${{ steps.prev.outputs.previous_tag }}"
+          Write-Host "Rollback complete to ${{ steps.prev.outputs.previous_tag }}"
