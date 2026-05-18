@@ -2,10 +2,10 @@
 #
 # Multi-stage Dockerfile for the MCP server (standalone build).
 #
-# The MCP server uses stdio transport - in the live compose stack, the
-# orchestration container spawns this code as a subprocess. This standalone
-# image is built for CI/CD's "build image for MCP server" requirement and
-# can be run independently for testing.
+# The vector store (ChromaDB index) is BUILT at image-build time from the
+# source k8s_docs.json document corpus. This keeps the git repo small
+# (~250 KB JSON vs ~50 MB ChromaDB binary files) while ensuring the image
+# is self-contained and reproducible.
 
 # ---------- Stage 1: builder ----------
 FROM python:3.11-slim AS builder
@@ -19,6 +19,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY docker/requirements.mcp.txt .
 RUN pip install --no-cache-dir --user -r requirements.mcp.txt
 
+# Build the ChromaDB index from the source docs
+# This downloads the sentence-transformers model and computes embeddings.
+ENV PATH=/root/.local/bin:$PATH
+COPY scripts/build_vector_store.py /build/scripts/
+COPY data/k8s_docs.json /build/data/
+WORKDIR /build
+RUN python scripts/build_vector_store.py
+
 
 # ---------- Stage 2: runtime ----------
 FROM python:3.11-slim AS runtime
@@ -30,18 +38,14 @@ WORKDIR /app
 COPY --from=builder /root/.local /home/appuser/.local
 RUN chown -R appuser:appuser /home/appuser/.local
 
-# Copy MCP server code and the persistent vector store
+# Copy MCP server code and the freshly-built vector store
 COPY --chown=appuser:appuser mcp_server/ ./mcp_server/
-COPY --chown=appuser:appuser data/chroma/ ./data/chroma/
+COPY --from=builder --chown=appuser:appuser /build/data/chroma/ ./data/chroma/
 COPY --chown=appuser:appuser data/k8s_docs.json ./data/
 
 USER appuser
 ENV PATH=/home/appuser/.local/bin:$PATH
 ENV PYTHONUNBUFFERED=1
-# Hugging Face cache dir (sentence-transformers model)
 ENV HF_HOME=/home/appuser/.cache/huggingface
-
-# Trigger model download at build time would slow CI; defer to first run.
-# A real production setup would pre-download in the builder stage.
 
 CMD ["python", "mcp_server/server.py"]
