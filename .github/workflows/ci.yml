@@ -278,8 +278,7 @@ jobs:
 
       - name: Log in to GHCR on runner
         run: |
-          $token = "${{ secrets.GHCR_TOKEN }}"
-          $token | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+          docker login ${{ env.REGISTRY }} -u ${{ github.actor }} -p "${{ secrets.GHCR_TOKEN }}"
 
       - name: Pull new images
         run: |
