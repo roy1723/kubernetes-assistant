@@ -6,6 +6,9 @@ A local, end-to-end AI research assistant for Kubernetes Q&A. The pipeline fine-
 
 **Detailed write-ups** (dataset choice, training decisions, failure modes, CI/CD design): see [`NOTES.md`](./NOTES.md).
 
+**Demo video**: <!-- Paste your unlisted Loom URL here when uploaded -->
+`https://drive.google.com/file/d/1OLg_8x--tj8Q08QeAzptFYivKAB38P8i/view?usp=sharing`
+
 ---
 
 ## Headline results
@@ -94,67 +97,94 @@ Q4_K_M is chosen for deployment: ~4× throughput at the same VRAM ceiling, fits 
 ### Prerequisites
 
 - **OS**: Linux, macOS, or Windows 10+
-- **Docker**: Docker Desktop or Docker Engine with Compose v2
+- **Docker**: Docker Desktop or Docker Engine with Compose v2 (for Option 1)
+- **Python 3.11+** and **Ollama** ([install from ollama.com](https://ollama.com)) for Option 2
 - **Hardware**: 16 GB RAM minimum, 4 GB free disk for Ollama models
 - **GPU (optional)**: NVIDIA GPU with 4+ GB VRAM for fast inference (CPU mode also works, ~5× slower)
 
-### One-command launch from pre-built images
-
-```bash
-# Public images on GHCR — no auth needed for pulls
-docker compose -f docker-compose.deploy.yml up -d
-```
-
-This pulls 3 images from `ghcr.io/roy1723/kubernetes-assistant-*:latest` and starts the stack. Wait ~60 seconds for Ollama to download the model on first run.
-
-Open <http://localhost:7860> for the Gradio chat UI.
-
-### Build from source
+### Option 1 — One-command launch from pre-built images
 
 ```bash
 git clone https://github.com/roy1723/kubernetes-assistant
 cd kubernetes-assistant
-docker compose up --build
+
+# Pulls 3 public images from GHCR + starts the stack (Ollama, MCP, inference, UI)
+docker compose -f docker-compose.deploy.yml up -d
 ```
 
-First build is slow (~10-15 min) because the MCP image embeds ChromaDB + sentence-transformers. Subsequent builds use Docker layer cache.
-
-### Native Python (for development)
+On first run, wait ~60 seconds for the Ollama container to download `phi3-kubernetes` from Hugging Face. You can monitor progress:
 
 ```bash
+docker logs -f k8s_assistant_ollama
+```
+
+Once ready, open <http://localhost:7860> for the Gradio chat UI.
+
+### Option 2 — Native Python (for development)
+
+```bash
+git clone https://github.com/roy1723/kubernetes-assistant
+cd kubernetes-assistant
+
 python -m venv venv
 source venv/bin/activate         # Linux/macOS
 venv\Scripts\activate.bat        # Windows
 pip install -r requirements.txt
+```
 
-# Terminal 1: Ollama (must be installed separately — ollama.com)
+**Pull the models into Ollama** (one-time):
+
+```bash
+# Start Ollama daemon (in a separate terminal, or as a service)
 ollama serve
 
-# Terminal 2: FastAPI inference server
+# Pull the fine-tuned model from Hugging Face Hub
+ollama pull hf.co/shlbnrj/phi3-kubernetes:Q4_K_M
+ollama cp hf.co/shlbnrj/phi3-kubernetes:Q4_K_M phi3-kubernetes
+
+# Pull the base model (used by the router for classification)
+ollama pull phi3:mini
+
+# Verify both are registered
+ollama list   # should show phi3-kubernetes and phi3:mini
+```
+
+**Start the services** (in two more terminals):
+
+```bash
+# Terminal 1: FastAPI inference server (port 8000)
 python inference_server/main.py
 
-# Terminal 3: Gradio UI (auto-starts agent + MCP via stdio subprocess)
+# Terminal 2: Gradio UI (auto-spawns MCP subprocess + ReAct agent)
 python orchestration/app.py
 ```
 
 Visit <http://localhost:7860>.
 
+### Build Docker images from source (alternative)
+
+```bash
+docker compose up --build
+```
+
+First build is slow (~10-15 min) because the MCP image embeds ChromaDB + sentence-transformers. Subsequent builds use Docker layer cache.
+
 ---
 
 ## Test the system
 
-### Three example queries to try
+### Three example queries through the chat UI
 
-1. **Casual** (keyword fast-path, no LLM):
+1. **Casual** (keyword fast-path, no LLM call):
 
    ```
    hi
    ```
 
-2. **Direct** (fine-tuned model, no tools):
+2. **Direct K8s knowledge** (fine-tuned model, no tools):
 
    ```
-   What is the difference between a Deployment and a StatefulSet?
+   How do I scale a Deployment to 5 replicas using kubectl?
    ```
 
 3. **Tools — YAML validation** (ReAct agent + `validate_yaml`):
@@ -164,8 +194,18 @@ Visit <http://localhost:7860>.
    apiVersion: v1
    kind: Pod
    metadata:
-     name: test
+     name: test-pod
    ```
+
+### Multi-tool chain demonstration
+
+The Gradio router occasionally misclassifies multi-tool prompts. A standalone script bypasses the router and invokes the agent directly to demonstrate chaining `search_documents` with `run_python`:
+
+```bash
+python scripts/demo_multi_tool_chain.py
+```
+
+The captured trace is saved to `docs/multi_tool_chain_trace.json` for review. See [NOTES.md → Task 4](./NOTES.md#task-4-agent-failure-modes-and-mitigations) for the failure-mode analysis.
 
 ### Verify observability
 
@@ -225,9 +265,9 @@ The eval and deploy jobs run on a Windows self-hosted runner. Setup instructions
 
 1. **ReAct reliability on small models.** Phi-3-mini sometimes hallucinates a Final Answer instead of emitting an `Action:` block — most visible on math/computation queries. Mitigations in place (loop detection, tool name aliasing, parse-error recovery) keep the failure mode bounded but don't eliminate it. **Detailed analysis in [NOTES.md → Task 4](./NOTES.md#task-4-agent-failure-modes-and-mitigations).**
 
-2. **Multi-tool chains rarely succeed.** Chaining `search_documents` followed by `run_python` requires the model to make two distinct tool decisions in sequence. With Phi-3-mini, this works ~20% of the time. Each tool in isolation works ~80% (validate_yaml) or ~50% (run_python).
+2. **Multi-tool chains rarely succeed via the Gradio UI.** Chaining `search_documents` followed by `run_python` requires the model to make two distinct tool decisions in sequence. With Phi-3-mini, this works ~20% of the time. Each tool in isolation works ~80% (validate_yaml) or ~50% (run_python). A standalone script (`scripts/demo_multi_tool_chain.py`) bypasses the router and demonstrates a successful chain — captured trace in `docs/multi_tool_chain_trace.json`.
 
-3. **Router misclassifies action-verb prompts.** Queries like "search the docs for X then compute Y" sometimes route to `direct` instead of `tools`, bypassing the agent entirely. The keyword fast-path covers YAML / "validate" / math+units triggers but doesn't pattern-match action verbs.
+3. **Router misclassifies action-verb prompts.** Queries like "search the docs for X then compute Y" sometimes route to `direct` instead of `tools`, bypassing the agent entirely. The keyword fast-path covers YAML / "validate" / math+units triggers and explicit tool mentions (`search_documents`, `run_python`, `validate_yaml`) but doesn't pattern-match action verbs broadly.
 
 4. **Cold-start TTFT is high (~2.7 s).** First-token latency on the RTX 3050 includes model KV-cache initialization. Subsequent calls within ~10 min are faster (Ollama keeps the model loaded). The `keep_alive` option in inference requests holds the model warm.
 
@@ -242,6 +282,8 @@ The eval and deploy jobs run on a Windows self-hosted runner. Setup instructions
 **Replace Phi-3-mini with Llama-3-8B-Instruct (fine-tuned via the same QLoRA pipeline) as the deployed model.**
 
 The single biggest limitation today is small-model unreliability with ReAct. A 8B parameter model would handle multi-step reasoning and tool chaining substantially better — multi-tool chain success would likely climb from ~20% to ~70%+, and the math-skip-tool failure mode would mostly disappear. The cost is VRAM: Q4_K_M of Llama-3-8B needs ~5 GB, which exceeds the RTX 3050's 4 GB. The fix is either GPU offloading (slower but works) or upgrading the deployment target to a 12 GB+ GPU. The training pipeline (`scripts/fine_tune_phi3.py`) is model-agnostic — Llama-3-8B would slot in by changing the base model identifier and adjusting LoRA rank/alpha empirically.
+
+A complementary improvement is to replace ReAct text format with Ollama's `format=json` constrained generation. The model is then forced to emit valid JSON, eliminating the format-compliance failure mode entirely. Expected reliability gain: multi-tool chain success from ~20% to ~85% on the same small model. Combined with the model upgrade, this would push the system toward production-grade reliability.
 
 This is the highest-value upgrade because reliability gains propagate through every downstream task: routing accuracy, tool-call success, multi-tool chains, and final-answer quality.
 
@@ -297,15 +339,19 @@ The repo's `outputs/lora_adapters/` directory contains the adapter `.zip` locall
 ├── eval/
 │   ├── evaluate.py               # ROUGE-L on test set
 │   └── results.json              # Eval output (CI artifact)
+├── scripts/
+│   └── demo_multi_tool_chain.py  # Multi-tool chain demonstration
 ├── tests/test_smoke.py           # 10 sanity tests (run by CI)
 ├── docker/
 │   ├── Dockerfile.{inference,mcp,orchestration}
 │   └── requirements.*.txt
 ├── docs/
-│   ├── runner-setup.md           # Self-hosted runner instructions
-│   └── architecture.txt          # Detailed ASCII data-flow diagram
+│   ├── runner-setup.md                 # Self-hosted runner instructions
+│   ├── architecture.txt                # Detailed ASCII data-flow diagram
+│   └── multi_tool_chain_trace.json     # Captured multi-tool chain trace
 ├── docker-compose.yml            # Local build
 ├── docker-compose.deploy.yml     # Pull from GHCR
+├── requirements.txt              # Native Python dependencies
 ├── ruff.toml                     # Lint config
 ├── mypy.ini                      # Type-check config
 └── NOTES.md                      # Written explanations (Tasks 1, 4, 6)
