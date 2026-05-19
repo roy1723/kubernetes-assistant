@@ -62,8 +62,8 @@ jobs:
           $dockerDir = "C:\Program Files\Docker\Docker\resources\bin"
 
           if (Test-Path "$pythonDir\python.exe") {
-            $pythonDir | Out-File -FilePath $env:GITHUB_PATH -Append
-            $pythonScripts | Out-File -FilePath $env:GITHUB_PATH -Append
+            $pythonDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+            $pythonScripts | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
             Write-Host "Added Python to PATH: $pythonDir"
           } else {
             Write-Host "ERROR: Python not found at $pythonDir\python.exe"
@@ -71,7 +71,7 @@ jobs:
           }
 
           if (Test-Path "$dockerDir\docker.exe") {
-            $dockerDir | Out-File -FilePath $env:GITHUB_PATH -Append
+            $dockerDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
             Write-Host "Added Docker to PATH: $dockerDir"
           } else {
             Write-Host "WARN: Docker not found at $dockerDir\docker.exe (eval doesn't need it)"
@@ -257,7 +257,7 @@ jobs:
         run: |
           $dockerDir = "C:\Program Files\Docker\Docker\resources\bin"
           if (Test-Path "$dockerDir\docker.exe") {
-            $dockerDir | Out-File -FilePath $env:GITHUB_PATH -Append
+            $dockerDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
             Write-Host "Added Docker to PATH: $dockerDir"
           } else {
             Write-Host "ERROR: Docker not found at $dockerDir"
@@ -268,13 +268,15 @@ jobs:
         run: |
           docker --version
 
-      - name: Record current image SHA for rollback
+      - name: Record current image ID for rollback
         id: prev
+        continue-on-error: true
         run: |
-          $prev = docker images --filter "reference=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:latest" --format "{{.Tag}}" | Select-Object -First 1
-          if (-not $prev) { $prev = "" }
-          Write-Host "Previous tag captured: $prev"
-          "previous_tag=$prev" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          $ErrorActionPreference = "Continue"
+          $prev = docker images --filter "reference=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:latest" --format "{{.ID}}" | Select-Object -First 1
+          if (-not $prev) { $prev = "none" }
+          Write-Host "Previous image ID: $prev"
+          "previous_id=$prev" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Log in to GHCR on runner
         run: |
@@ -321,10 +323,10 @@ jobs:
           exit 1
 
       - name: Rollback on health failure
-        if: failure() && steps.prev.outputs.previous_tag != ''
+        if: failure() && steps.prev.outputs.previous_id != 'none' && steps.prev.outputs.previous_id != ''
         run: |
-          Write-Host "Rolling back to previous tag: ${{ steps.prev.outputs.previous_tag }}"
-          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:${{ steps.prev.outputs.previous_tag }} ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:latest
-          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:${{ steps.prev.outputs.previous_tag }} ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-orchestration:latest
+          $prevId = "${{ steps.prev.outputs.previous_id }}"
+          Write-Host "Rolling back to previous image ID: $prevId"
+          docker tag $prevId ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.REPO_NAME }}-inference:latest
           docker compose -f docker-compose.deploy.yml up -d
-          Write-Host "Rollback complete to ${{ steps.prev.outputs.previous_tag }}"
+          Write-Host "Rollback complete to $prevId"
