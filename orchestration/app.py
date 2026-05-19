@@ -1,17 +1,40 @@
-import asyncio
+"""
+orchestration/app.py
+
+Gradio chat UI for the Kubernetes Assistant.
+
+Compatible with Gradio 6.x:
+  - gr.Chatbot uses the new messages format (list of {role, content} dicts)
+  - theme is passed to demo.launch(), not gr.Blocks()
+  - Async handlers are passed directly to msg.submit (no asyncio.run wrapper)
+
+The Router classifies each query as casual / direct / tools, then dispatches:
+  - casual: static greeting
+  - direct: FastAPI inference server (fine-tuned phi3-kubernetes)
+  - tools:  ReAct agent (which uses MCP tools via stdio)
+
+Session memory: Gradio gr.State holds per-conversation history. Both the
+agent and the direct path use this history for multi-turn context.
+
+Environment variables:
+  INFERENCE_URL - FastAPI inference server URL (default: http://localhost:8000)
+"""
+
 import logging
 import os
 import sys
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(PROJECT_ROOT, "agent"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(
+    0,
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agent"),
+)
 
 import gradio as gr
 import httpx
-from router import Router
 
 from agent import ReActAgent
+from router import Router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,58 +42,60 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-import os
-
 INFERENCE_URL = os.getenv("INFERENCE_URL", "http://localhost:8000")
-
-# ---------- Lifecycle ----------
-
-_agent: ReActAgent | None = None
-_router: Router | None = None
-_init_lock = asyncio.Lock()
-_run_lock = asyncio.Lock()
-
-
-async def get_router() -> Router:
-    global _router
-    if _router is None:
-        async with _init_lock:
-            if _router is None:
-                logger.info("Initializing router...")
-                _router = Router()
-    return _router
-
-
-async def get_agent() -> ReActAgent:
-    global _agent
-    if _agent is None:
-        async with _init_lock:
-            if _agent is None:
-                logger.info("Initializing ReAct agent (launching MCP server)...")
-                a = ReActAgent()
-                await a.start()
-                _agent = a
-                logger.info("Agent ready.")
-    return _agent
-
-
-# ---------- Direct inference (no agent, no tools) ----------
 
 DIRECT_SYSTEM_PROMPT = (
     "You are a Kubernetes expert assistant. Answer the user's question "
     "concisely and accurately, with concrete kubectl commands and YAML "
-    "examples where appropriate. Keep the answer focused and avoid "
-    "rambling. If you don't know something, say so."
+    "examples where appropriate."
 )
 
+CASUAL_RESPONSE = (
+    "Hi! I'm a Kubernetes assistant. I can help with:\n\n"
+    "- **Concepts and commands**: 'how do I scale a deployment?', "
+    "'what's the difference between a ConfigMap and a Secret?'\n"
+    "- **YAML validation**: paste a manifest and I'll check it\n"
+    "- **Calculations**: 'how many pods fit on 5 nodes with 16GB each?'\n\n"
+    "What would you like to know?"
+)
 
-async def call_inference_direct(query: str) -> str:
-    """Call the FastAPI inference server directly. No tools, no agent."""
+MAX_HISTORY = 6  # 3 user + 3 assistant turns retained
+
+
+# ---------- Lifecycle ----------
+
+agent: ReActAgent | None = None
+router: Router | None = None
+
+
+async def init_services():
+    """Initialize agent and router on first use."""
+    global agent, router
+    if agent is None:
+        agent = ReActAgent(inference_url=INFERENCE_URL)
+        await agent.start()
+        logger.info("Agent started.")
+    if router is None:
+        router = Router(inference_url=INFERENCE_URL)
+        logger.info("Router initialized.")
+
+
+# ---------- Direct path ----------
+
+async def call_inference_direct(
+    query: str, history: list[dict] | None = None
+) -> str:
+    """
+    Call the FastAPI inference server directly. No tools, no agent.
+    History is the prior turns in this session (capped).
+    """
+    messages: list[dict] = [{"role": "system", "content": DIRECT_SYSTEM_PROMPT}]
+    if history:
+        messages.extend(history[-MAX_HISTORY:])
+    messages.append({"role": "user", "content": query})
+
     payload = {
-        "messages": [
-            {"role": "system", "content": DIRECT_SYSTEM_PROMPT},
-            {"role": "user", "content": query},
-        ],
+        "messages": messages,
         "temperature": 0.4,
         "max_tokens": 512,
     }
@@ -80,128 +105,105 @@ async def call_inference_direct(query: str) -> str:
     return r.json()["response"].strip()
 
 
-# ---------- Casual ----------
+# ---------- Main handler ----------
 
-CASUAL_RESPONSE = (
-    "Hi! I'm a Kubernetes assistant. I can help with:\n\n"
-    "- **Concepts and commands**: \"how do I scale a deployment?\", "
-    "\"what's the difference between a ConfigMap and a Secret?\"\n"
-    "- **YAML validation**: paste a manifest and I'll check it\n"
-    "- **Calculations**: \"how many pods fit on 5 nodes with 16GB each?\"\n\n"
-    "What would you like to know?"
-)
+async def respond(message: str, chat_history: list, session_state: dict):
+    """
+    Async Gradio handler.
 
+    Args:
+        message: user's current message
+        chat_history: Gradio's display history (list of {role, content} dicts)
+        session_state: per-session dict containing 'history' (model messages)
 
-# ---------- Trace formatting (for agent path) ----------
+    Returns:
+        (cleared_input, updated chat_history, updated session_state)
+    """
+    await init_services()
+    assert router is not None
+    assert agent is not None
 
-def format_trace_summary(trace: list) -> str:
-    tool_calls = [t for t in trace if t.get("type") == "tool_call"]
-    if not tool_calls:
-        return ""
+    if "history" not in session_state:
+        session_state["history"] = []
 
-    parts = []
-    for tc in tool_calls:
-        tool = tc.get("tool", "?")
-        args = tc.get("input", {})
-        if isinstance(args, dict) and args:
-            first_value = next(iter(args.values()))
-            preview = str(first_value)[:60].replace("\n", " ")
-            if len(str(first_value)) > 60:
-                preview += "..."
-            parts.append(f"`{tool}({preview!r})`")
-        else:
-            parts.append(f"`{tool}()`")
+    history = session_state["history"]
 
-    return f"*Tools used: {' -> '.join(parts)}*\n\n"
+    # Route the query
+    route = await router.classify(message)
+    logger.info(f"Route for '{message[:60]}...': {route}")
 
-
-# ---------- Main chat handler ----------
-
-async def respond(message: str, history: list) -> str:
-    if not message or not message.strip():
-        return "Please ask a Kubernetes question."
-
-    # Step 1: Classify
-    try:
-        router = await get_router()
-        classification = await router.classify(message)
-    except Exception as e:
-        logger.error(f"Router failed: {e}. Defaulting to direct path.")
-        classification = "direct"
-
-    # Step 2: Route
-    route_label = f"*Route: {classification}*\n\n"
-
-    if classification == "casual":
-        return route_label + CASUAL_RESPONSE
-
-    elif classification == "direct":
+    # Dispatch
+    if route == "casual":
+        answer = CASUAL_RESPONSE
+    elif route == "direct":
         try:
-            answer = await call_inference_direct(message)
-            return route_label + answer
+            answer = await call_inference_direct(message, history=history)
         except Exception as e:
             logger.error(f"Direct inference failed: {e}")
-            return route_label + f"**Error calling inference server:** {e}"
-
-    elif classification == "tools":
+            answer = f"**Error calling inference server:** {e}"
+    elif route == "tools":
         try:
-            agent = await get_agent()
+            answer, trace = await agent.run(message, history=history)
         except Exception as e:
-            logger.error(f"Agent init failed: {e}")
-            return (
-                route_label
-                + f"**Failed to initialize agent:** {e}\n\n"
-                "Make sure Ollama and the FastAPI server are running."
-            )
-
-        async with _run_lock:
-            try:
-                answer, trace = await agent.run(message)
-            except Exception as e:
-                logger.error(f"agent.run failed: {e}")
-                return route_label + f"**Agent error:** {e}"
-
-        header = format_trace_summary(trace)
-        return route_label + header + answer
-
+            logger.error(f"Agent run failed: {e}")
+            answer = f"**Agent error:** {e}"
     else:
-        return route_label + "Could not classify query. Please rephrase."
+        answer = f"_Unknown route: {route}_"
+
+    # Update session history with this turn's exchange
+    history.append({"role": "user", "content": message})
+    history.append({"role": "assistant", "content": answer})
+    session_state["history"] = history[-MAX_HISTORY:]
+
+    # Gradio 6 expects messages format: list of {role, content} dicts
+    chat_history = chat_history + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": f"_Route: {route}_\n\n{answer}"},
+    ]
+
+    return "", chat_history, session_state
 
 
 # ---------- UI ----------
 
-EXAMPLES = [
-    # Casual
-    "Hi! What can you do?",
-    # Direct
-    "What's the difference between a ConfigMap and a Secret?",
-    # Tools
-    "Is this YAML valid?\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app-config\ndata:\n  key1: value1",
-    # Tools
-    "Calculate how many pods fit on 3 nodes with 32GB each, if each pod needs 4GB.",
-]
+with gr.Blocks(title="Kubernetes Assistant") as demo:
+    gr.Markdown("# Kubernetes Assistant")
+    gr.Markdown(
+        "A fine-tuned Phi-3-mini Kubernetes assistant with three response paths:\n\n"
+        "- **casual** -- greetings and off-topic queries get a static response\n"
+        "- **direct** -- simple K8s questions go straight to the fine-tuned model\n"
+        "- **tools** -- queries needing validation or computation use the ReAct agent with MCP tools\n\n"
+        "The router classifies your query first, then dispatches to the right handler. "
+        "Conversation memory is preserved within this chat session."
+    )
 
-DESCRIPTION = """
-A fine-tuned Phi-3-mini Kubernetes assistant with three response paths:
+    # Gradio 6: type="messages" is default and not a valid parameter
+    chatbot = gr.Chatbot(label="Chatbot", height=500)
+    msg = gr.Textbox(
+        label="Your message",
+        placeholder="Ask me about Kubernetes...",
+    )
+    clear = gr.Button("Clear conversation")
 
-- **casual** -- greetings and off-topic queries get a static response
-- **direct** -- simple K8s questions go straight to the fine-tuned model
-- **tools** -- queries needing validation or computation use the ReAct agent with MCP tools
+    # Per-session state - resets when "Clear" is pressed
+    session_state = gr.State({"history": []})
 
-The router classifies your query first, then dispatches to the right handler.
-"""
+    # Async handler passed directly; Gradio 6 manages the event loop
+    msg.submit(
+        respond,
+        inputs=[msg, chatbot, session_state],
+        outputs=[msg, chatbot, session_state],
+    )
 
+    def clear_session():
+        return [], {"history": []}
 
-demo = gr.ChatInterface(
-    fn=respond,
-    title="Kubernetes Assistant",
-    description=DESCRIPTION,
-    examples=EXAMPLES,
-)
+    clear.click(clear_session, outputs=[chatbot, session_state])
 
 
 if __name__ == "__main__":
-    demo.queue().launch(
+    # Gradio 6: theme moved here from gr.Blocks() constructor
+    demo.launch(
         server_name="0.0.0.0",
         server_port=7860,
         share=False,

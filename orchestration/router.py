@@ -4,10 +4,13 @@ orchestration/router.py
 Hybrid query router for the Kubernetes Assistant.
 
 Two-stage routing:
-  1. Keyword fast-path  (regex rules, O(microseconds))
-  2. LLM classifier     (base phi3:mini, ~500ms) for ambiguous cases
+  1. Keyword fast-path (regex rules, O(microseconds))
+  2. LLM classifier   (base phi3:mini, ~500ms) for ambiguous cases
 
 Labels: casual / direct / tools
+
+The router is stateless. Session history is managed in app.py and passed
+into the agent/direct path after routing.
 
 Environment variables:
   INFERENCE_URL - FastAPI inference server URL (default: http://localhost:8000)

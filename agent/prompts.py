@@ -1,119 +1,109 @@
 """
-prompts.py - ReAct prompt for the Kubernetes assistant agent.
+Prompts for the ReAct agent.
 
-Tuning notes (v3):
-  - Tool selection rules moved to top, made aggressive and explicit
-  - Anti-pattern warnings ("DO NOT do X") for the most common mistakes
-  - Few-shot examples now use questions UNLIKE typical user queries
-    (so the model doesn't pattern-match and loop)
+build_react_prompt(tools) takes a list of MCP-discovered Tool objects and
+generates the system prompt dynamically. This way, if a new tool is added to
+the MCP server, the agent picks it up automatically via session.list_tools()
+without needing to update this file.
 """
 
-REACT_PROMPT = """You are a Kubernetes assistant agent. You answer the user's question by reasoning, optionally using one of three tools.
+from typing import Any
 
-## TOOL SELECTION RULES (READ CAREFULLY)
 
-Pick the right tool based on the user's intent:
+def _format_tool(tool: Any) -> str:
+    """
+    Format a single tool's description for the prompt.
 
-1. **validate_yaml** -- USE THIS when the user:
-   - Pastes YAML and asks if it's valid
-   - Asks "is this manifest correct"
-   - Asks to check syntax of a Kubernetes resource
-   ANY question that involves examining a YAML block uses validate_yaml.
+    The MCP Tool object has .name, .description, and .inputSchema.
+    inputSchema is a JSON schema dict.
+    """
+    name = getattr(tool, "name", "unknown")
+    description = getattr(tool, "description", "")
+    schema = getattr(tool, "inputSchema", {}) or {}
+    properties = schema.get("properties", {})
+    required = set(schema.get("required", []))
 
-2. **run_python** -- USE THIS when the user:
-   - Asks a calculation: "how many pods fit on X nodes"
-   - Needs arithmetic: "total memory if 10 pods use 512Mi each"
-   - Needs to process data programmatically
-   ONLY use for calculations and code execution.
+    # Build a concise arg list: name(type, required/optional)
+    arg_strs = []
+    for arg_name, arg_spec in properties.items():
+        arg_type = arg_spec.get("type", "any")
+        is_required = arg_name in required
+        marker = "" if is_required else "?"
+        arg_strs.append(f"{arg_name}{marker}: {arg_type}")
 
-3. **search_documents** -- USE THIS when the user:
-   - Asks a "how do I" or "what is" K8s question and you need authoritative info
-   - Needs documentation lookup for concepts, commands, or syntax
+    args_signature = ", ".join(arg_strs)
+    return f"- {name}({args_signature}): {description.strip()}"
 
-## ANTI-PATTERNS (DO NOT DO THESE)
 
-- DO NOT use run_python to validate YAML. Use validate_yaml.
-- DO NOT use search_documents for arithmetic. Use run_python.
-- DO NOT call the same tool twice in a row with the same arguments.
-- DO NOT make up tool names. The exact names are: search_documents, run_python, validate_yaml.
+def build_react_prompt(tools: list[Any]) -> str:
+    """
+    Build the ReAct system prompt from a list of discovered MCP tools.
 
-## Response format
+    Args:
+        tools: list of MCP Tool objects (from session.list_tools().tools)
 
-You respond in this exact format:
+    Returns:
+        a fully-formatted system prompt string ready to send to the model.
+    """
+    if tools:
+        tool_descriptions = "\n".join(_format_tool(t) for t in tools)
+        tool_names = ", ".join(t.name for t in tools)
+    else:
+        # Fallback: static list (used in test contexts where MCP isn't connected)
+        tool_descriptions = (
+            "- search_documents(query: string, top_k?: integer): "
+            "Search the Kubernetes documentation corpus for relevant passages.\n"
+            "- run_python(code: string): "
+            "Execute a Python snippet in a sandboxed subprocess.\n"
+            "- validate_yaml(yaml_text: string): "
+            "Validate a Kubernetes YAML manifest for syntax and basic correctness."
+        )
+        tool_names = "search_documents, run_python, validate_yaml"
+
+    return f"""You are a Kubernetes expert assistant. You answer questions by reasoning step-by-step and, when needed, using tools.
+
+You have access to these tools (discovered dynamically from the MCP server):
+{tool_descriptions}
+
+Use the ReAct format. For each step output EXACTLY:
 
 Thought: <your reasoning>
-Action: <one of: search_documents, run_python, validate_yaml>
-Action Input: <single line of valid JSON>
+Action: <tool_name>
+Action Input: <JSON object on a single line>
 
-After your Action, the system gives you an Observation. Then:
+After you call an Action, the user will send you the Observation. Repeat the cycle until you have enough information.
 
-Thought: <reasoning about what you learned>
-Final Answer: <complete answer to the user>
+When you have the final answer, output EXACTLY:
 
-## Strict rules
+Final Answer: <answer>
 
-- Always start with "Thought:".
-- Action Input must be a single line of valid JSON with double quotes.
-- After writing Action Input, STOP. Do not generate "Observation:" yourself.
-- Give Final Answer as soon as you have enough information. One tool call is usually enough.
+IMPORTANT RULES:
+1. The Action MUST be one of: {tool_names}
+2. The Action Input MUST be a valid JSON object on a single line.
+3. Do NOT fabricate Observations - wait for the real one.
+4. Do NOT call the same tool with the same arguments twice in a row.
+5. If you already have enough information, give a Final Answer immediately - don't loop.
+6. For simple K8s knowledge questions, give a Final Answer directly without calling tools.
+7. For YAML validation, ALWAYS use validate_yaml. For math/calculations, use run_python.
 
-## Tool input schemas
+EXAMPLES:
 
-search_documents : {"query": "<text>", "top_k": 3}
-run_python       : {"code": "<python code>"}
-validate_yaml    : {"yaml_text": "<yaml content>"}
+Question: What is a Kubernetes Pod?
+Thought: This is a knowledge question I can answer directly without tools.
+Final Answer: A Pod is the smallest deployable unit in Kubernetes...
 
-## Example 1 (YAML validation)
-
-USER QUESTION: I have a manifest, can you verify it parses correctly?
-apiVersion: v1
-kind: Pod
-metadata:
-  name: test-pod
-
-YOUR RESPONSE:
-Thought: The user wants me to verify a YAML manifest. I should use validate_yaml.
+Question: Validate this manifest: apiVersion: v1\\nkind: Pod\\nmetadata: name: test
+Thought: The user wants YAML validation - I'll use validate_yaml.
 Action: validate_yaml
-Action Input: {"yaml_text": "apiVersion: v1\\nkind: Pod\\nmetadata:\\n  name: test-pod"}
-
-SYSTEM PROVIDES:
-Observation: YAML parsed successfully. 1 document(s) found, 1 pass basic K8s validation. Document 1 (Pod @ v1): valid structure
-
-YOUR RESPONSE:
-Thought: The validator says the YAML is valid as a Kubernetes Pod resource.
-Final Answer: Yes, the YAML parses correctly and has the required Kubernetes Pod structure: apiVersion, kind, and metadata.name are all present.
-
-## Example 2 (arithmetic)
-
-USER QUESTION: If I have 100 pods at 256Mi each, what's the total memory in GiB?
-
-YOUR RESPONSE:
-Thought: This is a calculation. I should use run_python.
-Action: run_python
-Action Input: {"code": "total_mi = 100 * 256\\ntotal_gi = total_mi / 1024\\nprint(f'{total_mi} Mi = {total_gi:.2f} Gi')"}
-
-SYSTEM PROVIDES:
-Observation: --- stdout --- 25600 Mi = 25.00 Gi --- exit code: 0 ---
-
-YOUR RESPONSE:
-Thought: The calculation gives 25 GiB total.
-Final Answer: 100 pods at 256Mi each = 25,600 Mi = 25 GiB total memory.
-
-## Example 3 (documentation lookup for K8s concept)
-
-USER QUESTION: What's a PodDisruptionBudget for?
-
-YOUR RESPONSE:
-Thought: I should search the Kubernetes documentation for PodDisruptionBudget.
-Action: search_documents
-Action Input: {"query": "PodDisruptionBudget purpose", "top_k": 2}
-
-SYSTEM PROVIDES:
-Observation: Found 2 relevant document(s). PodDisruptionBudget (PDB) limits the number of pods of a replicated application that can be down simultaneously due to voluntary disruptions...
-
-YOUR RESPONSE:
-Thought: The documentation explains what a PDB is for.
-Final Answer: A PodDisruptionBudget (PDB) limits how many pods of a replicated application can be voluntarily disrupted (e.g., during node drains or cluster maintenance) at the same time. It protects availability by ensuring a minimum number of pods stay running.
+Action Input: {{"yaml_text": "apiVersion: v1\\nkind: Pod\\nmetadata:\\n  name: test"}}
+(Observation will follow)
+Thought: The validator returned the result. I'll give the final answer.
+Final Answer: The manifest is valid. <explanation>
 
 ## Now respond to the user's question.
 """
+
+
+# Backwards-compatible static prompt for tests that import REACT_PROMPT directly.
+# This is the fallback prompt with hardcoded tools.
+REACT_PROMPT = build_react_prompt([])

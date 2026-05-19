@@ -1,3 +1,21 @@
+"""
+agent.py - ReAct agent for the Kubernetes Assistant.
+
+Features:
+  - Tool discovery: queries MCP server with session.list_tools() at startup,
+    builds the system prompt dynamically from the response.
+  - Session memory: optional `history` parameter to run() preserves multi-turn
+    context within a session.
+  - Token aggregation: per-turn input/output token counts are summed across
+    all inference calls and logged in the JSON record.
+  - Loop detection: same (tool, args) twice -> nudge; three times -> forced exit
+  - Tool name aliasing: corrects common misspellings before calling MCP
+  - Parse errors -> retry message asking model to use valid JSON
+
+Environment variables:
+  INFERENCE_URL - FastAPI inference server URL (default: http://localhost:8000)
+"""
+
 import json
 import logging
 import os
@@ -13,7 +31,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from prompts import REACT_PROMPT
+from prompts import build_react_prompt
 
 # ---------- Configuration ----------
 INFERENCE_URL = os.getenv("INFERENCE_URL", "http://localhost:8000")
@@ -25,6 +43,7 @@ LOG_DIR.mkdir(exist_ok=True)
 MAX_STEPS = 3
 OBSERVATION_MAX_LEN = 1500
 INFERENCE_TIMEOUT = 180.0
+MAX_HISTORY_MESSAGES = 6  # session history cap (3 user + 3 assistant)
 
 TOOL_NAME_ALIASES = {
     "search_documentation": "search_documents",
@@ -58,11 +77,17 @@ logger = logging.getLogger(__name__)
 logger.info(f"Agent initializing. INFERENCE_URL={INFERENCE_URL}")
 
 
-def normalize_tool_name(name: str) -> str:
-    if name in CANONICAL_TOOLS:
+def normalize_tool_name(name: str, canonical_tools: set[str] | None = None) -> str:
+    """
+    Map common LLM misspellings to canonical tool names.
+    canonical_tools defaults to the static set if not provided.
+    """
+    if canonical_tools is None:
+        canonical_tools = CANONICAL_TOOLS
+    if name in canonical_tools:
         return name
     lowered = name.lower().strip()
-    if lowered in CANONICAL_TOOLS:
+    if lowered in canonical_tools:
         return lowered
     if lowered in TOOL_NAME_ALIASES:
         corrected = TOOL_NAME_ALIASES[lowered]
@@ -113,7 +138,16 @@ class JSONLogger:
         date_stamp = datetime.now().strftime("%Y%m%d")
         self.log_file = LOG_DIR / f"agent_{date_stamp}.jsonl"
 
-    def log_session(self, session_id, question, answer, trace, latency_ms):
+    def log_session(
+        self,
+        session_id,
+        question,
+        answer,
+        trace,
+        latency_ms,
+        input_tokens,
+        output_tokens,
+    ):
         n_tool_calls = sum(1 for t in trace if t["type"] == "tool_call")
         record = {
             "timestamp": datetime.now().isoformat(),
@@ -123,6 +157,8 @@ class JSONLogger:
             "n_steps": len(trace),
             "n_tool_calls": n_tool_calls,
             "latency_ms": latency_ms,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
             "trace": trace,
         }
         with open(self.log_file, "a", encoding="utf-8") as f:
@@ -137,6 +173,7 @@ class MCPClient:
         self.session: ClientSession | None = None
         self._stdio_cm = None
         self._session_cm = None
+        self.tools: list = []  # populated by discover_tools()
 
     async def start(self):
         params = StdioServerParameters(
@@ -149,6 +186,20 @@ class MCPClient:
         self.session = await self._session_cm.__aenter__()
         await self.session.initialize()
         logger.info("MCP client connected.")
+
+    async def discover_tools(self) -> list:
+        """
+        Query the MCP server's tool list via list_tools().
+        Per the MCP spec, this returns the server's exposed capabilities.
+        """
+        if not self.session:
+            raise RuntimeError("MCP client not started")
+        result = await self.session.list_tools()
+        # mcp.types.ListToolsResult has .tools attribute
+        self.tools = getattr(result, "tools", []) or []
+        names = [t.name for t in self.tools]
+        logger.info(f"MCP discovery: found {len(self.tools)} tools: {names}")
+        return self.tools
 
     async def stop(self):
         try:
@@ -183,14 +234,32 @@ class ReActAgent:
         self.max_steps = max_steps
         self.mcp = MCPClient(mcp_server_script)
         self.json_logger = JSONLogger()
+        self.discovered_tools: list = []
+        self.discovered_tool_names: set[str] = set()
+        self.system_prompt: str = ""
 
     async def start(self):
+        """Start MCP, discover tools, build the system prompt dynamically."""
         await self.mcp.start()
+        self.discovered_tools = await self.mcp.discover_tools()
+        self.discovered_tool_names = {t.name for t in self.discovered_tools}
+        # Build the prompt with discovered tools (replaces hardcoded list)
+        self.system_prompt = build_react_prompt(self.discovered_tools)
+        logger.info(
+            f"Agent ready. {len(self.discovered_tools)} tools available: "
+            f"{sorted(self.discovered_tool_names)}"
+        )
 
     async def stop(self):
         await self.mcp.stop()
 
-    async def call_inference(self, messages: list, stop: list[str] = None) -> str:
+    async def call_inference(
+        self, messages: list, stop: list[str] | None = None
+    ) -> dict:
+        """
+        Call the FastAPI inference server's /chat endpoint.
+        Returns the full response dict including token counts.
+        """
         async with httpx.AsyncClient(timeout=INFERENCE_TIMEOUT) as client:
             payload = {
                 "messages": messages,
@@ -201,7 +270,7 @@ class ReActAgent:
                 payload["stop"] = stop
             r = await client.post(f"{self.inference_url}/chat", json=payload)
             r.raise_for_status()
-            return r.json()["response"]
+            return r.json()
 
     @staticmethod
     def _call_signature(tool: str, args: dict) -> str:
@@ -211,14 +280,36 @@ class ReActAgent:
             args_str = str(args)
         return f"{tool}::{args_str}"
 
-    async def run(self, question: str) -> tuple[str, list]:
+    async def run(
+        self,
+        question: str,
+        history: list[dict] | None = None,
+    ) -> tuple[str, list]:
+        """
+        Execute one ReAct turn.
+
+        Args:
+            question: the user's current query.
+            history: optional list of past {"role", "content"} messages from
+                     prior turns in this session. Will be inserted between the
+                     system prompt and the current question.
+
+        Returns:
+            (final_answer, trace) tuple. The trace is the full ReAct trace
+            for THIS turn only (history isn't included in the trace).
+        """
         session_id = uuid.uuid4().hex[:8]
         start_time = time.time()
 
-        messages = [
-            {"role": "system", "content": REACT_PROMPT},
-            {"role": "user", "content": f"Question: {question}"},
+        # Build initial message list: system + history + current question
+        messages: list[dict] = [
+            {"role": "system", "content": self.system_prompt or build_react_prompt(self.discovered_tools)},
         ]
+        if history:
+            # Cap history to MAX_HISTORY_MESSAGES most recent
+            capped = history[-MAX_HISTORY_MESSAGES:]
+            messages.extend(capped)
+        messages.append({"role": "user", "content": f"Question: {question}"})
 
         trace: list[dict] = []
         answer: str | None = None
@@ -226,9 +317,13 @@ class ReActAgent:
         duplicate_call_count: int = 0
         last_observation: str | None = None
 
+        # Aggregated token counts across all inference calls in this turn
+        total_input_tokens = 0
+        total_output_tokens = 0
+
         for step in range(self.max_steps):
             try:
-                model_out = await self.call_inference(
+                resp = await self.call_inference(
                     messages, stop=["Observation:"]
                 )
             except Exception as e:
@@ -236,6 +331,11 @@ class ReActAgent:
                 answer = f"Inference server error: {e}"
                 break
 
+            # Accumulate tokens
+            total_input_tokens += resp.get("prompt_tokens", 0)
+            total_output_tokens += resp.get("tokens", 0)
+
+            model_out = resp.get("response", "")
             trace.append({"step": step, "type": "model_output", "content": model_out})
             parsed = parse_output(model_out)
 
@@ -246,7 +346,9 @@ class ReActAgent:
 
             elif parsed["type"] == "action":
                 raw_tool_name = parsed["tool"]
-                tool_name = normalize_tool_name(raw_tool_name)
+                # Use discovered tools as the canonical set for aliasing
+                canonical = self.discovered_tool_names or CANONICAL_TOOLS
+                tool_name = normalize_tool_name(raw_tool_name, canonical)
                 if tool_name != raw_tool_name:
                     trace.append({
                         "step": step,
@@ -375,7 +477,13 @@ class ReActAgent:
 
         latency_ms = int((time.time() - start_time) * 1000)
         self.json_logger.log_session(
-            session_id, question, answer, trace, latency_ms
+            session_id,
+            question,
+            answer,
+            trace,
+            latency_ms,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
         )
 
         return answer, trace

@@ -1,3 +1,13 @@
+"""
+tests/test_smoke.py
+
+Lightweight sanity tests run in CI before the heavy evaluation.
+Verifies that key imports work and tool modules load cleanly.
+
+Run:
+    pytest tests/test_smoke.py -v
+"""
+
 import importlib
 import os
 import sys
@@ -27,10 +37,47 @@ def test_router_imports():
 
 
 def test_prompts_imports():
-    """Prompts module imports and provides REACT_PROMPT."""
+    """Prompts module imports and provides build_react_prompt."""
     m = importlib.import_module("prompts")
+    assert hasattr(m, "build_react_prompt")
     assert hasattr(m, "REACT_PROMPT")
-    assert len(m.REACT_PROMPT) > 500  # non-trivial prompt content
+    # The fallback prompt should still be substantial
+    assert len(m.REACT_PROMPT) > 500
+
+
+def test_build_react_prompt_empty_uses_fallback():
+    """build_react_prompt with no tools uses the static fallback list."""
+    from prompts import build_react_prompt
+
+    prompt = build_react_prompt([])
+    assert "search_documents" in prompt
+    assert "run_python" in prompt
+    assert "validate_yaml" in prompt
+    assert "ReAct" in prompt or "Thought:" in prompt
+
+
+def test_build_react_prompt_uses_discovered_tools():
+    """build_react_prompt with discovered tools formats them in."""
+    from prompts import build_react_prompt
+
+    class FakeTool:
+        def __init__(self, name, description, schema):
+            self.name = name
+            self.description = description
+            self.inputSchema = schema
+
+    tools = [
+        FakeTool(
+            "my_custom_tool",
+            "Does a custom thing",
+            {"properties": {"x": {"type": "string"}}, "required": ["x"]},
+        ),
+    ]
+    prompt = build_react_prompt(tools)
+    assert "my_custom_tool" in prompt
+    assert "Does a custom thing" in prompt
+    # The hardcoded fallback names should NOT appear when real tools are provided
+    assert "search_documents" not in prompt
 
 
 def test_tool_name_aliasing():
@@ -41,6 +88,18 @@ def test_tool_name_aliasing():
     assert normalize_tool_name("validate") == "validate_yaml"
     assert normalize_tool_name("python") == "run_python"
     assert normalize_tool_name("search_documents") == "search_documents"
+
+
+def test_tool_name_aliasing_with_custom_canonical():
+    """normalize_tool_name accepts a custom canonical set (for discovered tools)."""
+    from agent import normalize_tool_name
+
+    custom_set = {"my_tool_a", "my_tool_b"}
+    # Canonical members pass through
+    assert normalize_tool_name("my_tool_a", custom_set) == "my_tool_a"
+    # Aliased names still get corrected to the standard names
+    # (because TOOL_NAME_ALIASES is the same)
+    assert normalize_tool_name("search_documents", custom_set) == "search_documents"
 
 
 def test_router_keyword_routes():
