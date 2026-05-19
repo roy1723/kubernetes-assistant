@@ -32,9 +32,9 @@ sys.path.insert(
 
 import gradio as gr
 import httpx
+from router import Router
 
 from agent import ReActAgent
-from router import Router
 
 logging.basicConfig(
     level=logging.INFO,
